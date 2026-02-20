@@ -346,7 +346,15 @@ class VALORANTScraper:
         for match_id in series_meta.match_ids:
             logger.info("マッチデータ取得中: match_id=%s", match_id)
 
-            match_data = raw_match_cache.get(match_id) or fetch_match_data(self.client, match_id)
+            # match URL から直接起動した場合のみ original_url を渡す
+            orig = (
+                series_url
+                if url_type == "match" and match_id == page_id
+                else None
+            )
+            match_data = raw_match_cache.get(match_id) or fetch_match_data(
+                self.client, match_id, original_url=orig
+            )
             if not match_data:
                 logger.warning("マッチ %s のデータ取得に失敗。スキップします", match_id)
                 continue

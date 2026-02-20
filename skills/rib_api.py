@@ -199,31 +199,55 @@ class RibGGClient:
     セッション管理・レート制限・リトライロジックをカプセル化します。
     """
 
-    def __init__(self, cache_dir: Optional[Path] = None, warmup: bool = True) -> None:
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        use_browser: bool = True,
+    ) -> None:
         """
         Args:
             cache_dir: 生JSONをキャッシュするディレクトリ。
                        None の場合はキャッシュを行いません。
-            warmup: True の場合、初期化時にホームページを訪問して
-                    セッションクッキーを取得します（ボット検出対策）。
+            use_browser: True の場合、Playwright Chromium を起動して
+                         TLSフィンガープリント偽装によるボット検出回避を試みます。
+                         playwright 未インストール時は requests にフォールバックします。
         """
         self.session = requests.Session()
-        # セッションにベースヘッダーをセット（get_html/get_json で上書きする）
         self.session.headers.update({
-            "User-Agent":       _UA,
-            "Accept-Language":  "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding":  "gzip, deflate",
-            "sec-ch-ua":        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-            "sec-ch-ua-mobile": "?0",
+            "User-Agent":         _UA,
+            "Accept-Language":    "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding":    "gzip, deflate",
+            "sec-ch-ua":          '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile":   "?0",
             "sec-ch-ua-platform": '"Windows"',
         })
         self.cache_dir = cache_dir
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
         self._last_request_time: float = 0.0
+        self._browser: Optional["PlaywrightBrowser"] = None
 
-        if warmup:
+        if use_browser:
+            try:
+                self._browser = PlaywrightBrowser()
+                logger.info("Playwrightブラウザモード: 有効 (TLSフィンガープリント偽装)")
+            except ImportError as e:
+                logger.warning("%s", e)
+                logger.warning("requestsモードにフォールバック（ボット検出される可能性あり）")
+                self._warmup()
+            except Exception as e:
+                logger.warning("ブラウザ起動失敗: %s — requestsモードにフォールバック", e)
+                self._warmup()
+        else:
             self._warmup()
+
+    def __del__(self) -> None:
+        """ブラウザリソースを解放する"""
+        if getattr(self, "_browser", None):
+            try:
+                self._browser.close()
+            except Exception:
+                pass
 
     def _warmup(self) -> None:
         """
@@ -358,12 +382,19 @@ class RibGGClient:
         """
         指定URLからHTMLテキストを取得します。
 
+        Playwright ブラウザが利用可能な場合は本物の Chromium でアクセスし、
+        TLSフィンガープリント検出によるボット対策を回避します。
+
         Args:
             url: 取得先URL
 
         Returns:
             HTMLテキスト文字列。失敗時はNone
         """
+        # Playwright が利用可能な場合は優先して使う
+        if self._browser:
+            return self._browser.get_html(url)
+
         self._enforce_rate_limit()
 
         # HTML ページ取得ヘッダー: Sec-Fetch-Site を same-origin/cross-site で切り替える
@@ -418,6 +449,199 @@ class RibGGClient:
 
 
 # ---------------------------------------------------------------------------
+# Playwright ブラウザクライアント（TLSフィンガープリント偽装・ボット検出回避）
+# ---------------------------------------------------------------------------
+
+class PlaywrightBrowser:
+    """
+    Playwright Chromium ブラウザセッション。
+
+    Python requests ライブラリは TLS フィンガープリントが urllib3 独自実装のため、
+    Envoy / Cloudflare などの高度なボット検出（JA3/JA4 フィンガープリント検査）を
+    通過できません。Playwright は本物の Chromium を起動するため TLS が一致し、
+    ボット検出を回避できます。
+
+    取得フロー:
+      1. get_next_data()  … JS 経由で __NEXT_DATA__ を直接取得（最速・最優先）
+      2. intercept_api()  … ページロード時のAPIレスポンスをネットワーク傍受
+      3. get_html()       … 生HTMLを返す（BeautifulSoup でパース）
+
+    使い方:
+        browser = PlaywrightBrowser()
+        data = browser.get_next_data("https://www.rib.gg/events/.../matches/6244")
+        browser.close()
+    """
+
+    def __init__(self, headless: bool = True) -> None:
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "playwright がインストールされていません。\n"
+                "インストール方法:\n"
+                "  pip install playwright\n"
+                "  playwright install chromium"
+            )
+        from playwright.sync_api import sync_playwright
+
+        logger.info("Playwrightブラウザを起動中 (headless=%s) ...", headless)
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=headless)
+        self._context = self._browser.new_context(
+            user_agent=_UA,
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={"width": 1920, "height": 1080},
+            extra_http_headers={
+                "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        logger.info("Playwrightブラウザ起動完了")
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """ホームページを訪問してセッションクッキーを確立する"""
+        page = self._context.new_page()
+        try:
+            logger.info("ブラウザセッション初期化: %s を訪問中...", BASE_URL)
+            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
+            cookies = len(self._context.cookies())
+            logger.info("ブラウザセッション初期化完了: cookies=%d件", cookies)
+        except Exception as e:
+            logger.warning("ブラウザウォームアップ失敗（続行します）: %s", e)
+        finally:
+            page.close()
+
+    def get_html(self, url: str) -> Optional[str]:
+        """指定URLのページHTMLを取得する（JavaScript実行後の完全なDOM）"""
+        page = self._context.new_page()
+        try:
+            logger.info("ブラウザ GET HTML: %s", url)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            time.sleep(0.5)  # 動的コンテンツの追加レンダリング待機
+            return page.content()
+        except Exception as e:
+            logger.error("ブラウザ HTMLフェッチエラー: %s", e)
+            return None
+        finally:
+            page.close()
+
+    def get_next_data(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        指定URLの Next.js __NEXT_DATA__ を JavaScript 経由で直接取得する。
+
+        Next.js SSR では <script id="__NEXT_DATA__"> にサーバーサイドレンダリング済み
+        データが埋め込まれます。JS で直接パースすることで高速・確実に取得できます。
+
+        Args:
+            url: rib.gg のページURL
+
+        Returns:
+            __NEXT_DATA__ dict。取得失敗時はNone
+        """
+        page = self._context.new_page()
+        try:
+            logger.info("ブラウザ GET __NEXT_DATA__: %s", url)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+            # JavaScript で直接 __NEXT_DATA__ を取得（最速）
+            data = page.evaluate("""() => {
+                try {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    return el ? JSON.parse(el.textContent) : null;
+                } catch(e) { return null; }
+            }""")
+
+            if data:
+                logger.info("__NEXT_DATA__ を取得しました: %s", url)
+                return data
+
+            # JS取得失敗 → HTML全体を BeautifulSoup でパース（フォールバック）
+            logger.debug("JS取得失敗。HTMLをBeautifulSoupでパースします")
+            return RibGGClient._extract_next_data(page.content())
+
+        except Exception as e:
+            logger.error("__NEXT_DATA__ 取得エラー: %s", e)
+            return None
+        finally:
+            page.close()
+
+    def intercept_api(
+        self,
+        page_url: str,
+        api_pattern: str = "/api/",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        ページ読み込み時のAPIレスポンスをネットワーク傍受してJSONを返す。
+
+        rib.gg は Next.js アプリのため、クライアントサイドで内部APIを呼び出します。
+        Playwright のネットワークインターセプト機能でそのAPIレスポンスをキャプチャし、
+        __NEXT_DATA__ に含まれないデータも取得できます。
+
+        Args:
+            page_url: 読み込むページURL
+            api_pattern: キャプチャするAPIのURLパターン（部分一致）
+
+        Returns:
+            キャプチャしたJSONデータ（最もデータ量の多いもの）。失敗時はNone
+        """
+        captured: List[Dict[str, Any]] = []
+
+        def on_response(response: Any) -> None:
+            if api_pattern in response.url and response.status == 200:
+                try:
+                    ct = response.headers.get("content-type", "")
+                    if "json" in ct:
+                        captured.append({
+                            "url":  response.url,
+                            "data": response.json(),
+                        })
+                        logger.debug("APIレスポンスキャプチャ: %s", response.url)
+                except Exception:
+                    pass
+
+        page = self._context.new_page()
+        page.on("response", on_response)
+        try:
+            logger.info(
+                "ブラウザ APIインターセプト: %s (pattern=%s)", page_url, api_pattern
+            )
+            page.goto(page_url, wait_until="networkidle", timeout=45_000)
+
+            if not captured:
+                logger.warning("APIレスポンスをキャプチャできませんでした: %s", page_url)
+                return None
+
+            logger.info("APIレスポンス %d件キャプチャ完了", len(captured))
+            # 最もデータ量の多いレスポンスを採用
+            best = max(captured, key=lambda x: len(str(x["data"])))
+            logger.info("採用エンドポイント: %s", best["url"])
+            return best["data"]
+
+        except Exception as e:
+            logger.error("APIインターセプトエラー: %s", e)
+            return None
+        finally:
+            page.close()
+
+    def close(self) -> None:
+        """ブラウザリソースを解放する"""
+        try:
+            self._context.close()
+            self._browser.close()
+            self._pw.stop()
+            logger.debug("Playwrightブラウザを終了しました")
+        except Exception:
+            pass
+
+    def __enter__(self) -> "PlaywrightBrowser":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
 # シリーズデータ取得
 # ---------------------------------------------------------------------------
 
@@ -452,23 +676,29 @@ def fetch_series_data(
         logger.info("シリーズデータをAPIから取得しました: series_id=%s", series_id)
         return data
 
-    # Priority 2: __NEXT_DATA__ からフォールバック
-    logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
+    # Priority 2: ブラウザ / HTML から __NEXT_DATA__ を取得
     page_url = f"{BASE_URL}/series/{series_id}"
-    html = client.get_html(page_url)
-    if html:
-        next_data = client._extract_next_data(html)
+    logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
+
+    def _extract_series_from_next_data(nd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return nd.get("props", {}).get("pageProps", {}).get("series")
+
+    if client._browser:
+        next_data = client._browser.get_next_data(page_url)
         if next_data:
-            # __NEXT_DATA__ の構造: props.pageProps.series
-            series = (
-                next_data
-                .get("props", {})
-                .get("pageProps", {})
-                .get("series")
-            )
+            series = _extract_series_from_next_data(next_data)
             if series:
-                logger.info("__NEXT_DATA__ からシリーズデータを取得しました")
+                logger.info("ブラウザ __NEXT_DATA__ からシリーズデータを取得しました")
                 return series
+    else:
+        html = client.get_html(page_url)
+        if html:
+            next_data = client._extract_next_data(html)
+            if next_data:
+                series = _extract_series_from_next_data(next_data)
+                if series:
+                    logger.info("__NEXT_DATA__ からシリーズデータを取得しました")
+                    return series
 
     logger.error("シリーズデータの取得に失敗しました: series_id=%s", series_id)
     return None
@@ -571,13 +801,14 @@ def fetch_match_data(
             logger.info("マッチデータを取得しました: match_id=%s (endpoint: %s)", match_id, api_url)
             return data
 
-    # Priority 2: ページHTMLの __NEXT_DATA__ からフォールバック
-    # original_url が指定されていればそちらを優先（正しいパスを保証）
-    logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
+    # Priority 2: Playwright ブラウザ経由で __NEXT_DATA__ を取得
+    # original_url が指定されていればそちらを使う（正しいページパスを保証）
     page_url = original_url or f"{BASE_URL}/matches/{match_id}"
-    html = client.get_html(page_url)
-    if html:
-        next_data = client._extract_next_data(html)
+
+    if client._browser:
+        # 2a: __NEXT_DATA__ を JavaScript で直接取得（最優先・高速）
+        logger.info("ブラウザで __NEXT_DATA__ を取得します: %s", page_url)
+        next_data = client._browser.get_next_data(page_url)
         if next_data:
             match_data = (
                 next_data.get("props", {}).get("pageProps", {}).get("match")
@@ -585,8 +816,30 @@ def fetch_match_data(
                 or next_data.get("props", {}).get("pageProps")
             )
             if match_data:
-                logger.info("__NEXT_DATA__ からマッチデータを取得しました: match_id=%s", match_id)
+                logger.info("ブラウザ __NEXT_DATA__ からマッチデータを取得しました")
                 return match_data
+
+        # 2b: ページ内APIコールをネットワーク傍受（__NEXT_DATA__ に含まれない場合）
+        logger.info("__NEXT_DATA__ にデータなし。APIインターセプトを試みます...")
+        api_data = client._browser.intercept_api(page_url)
+        if api_data:
+            logger.info("APIインターセプトでマッチデータを取得しました")
+            return api_data
+    else:
+        # Playwright 未使用時: requests でHTMLフォールバック
+        logger.info("APIが失敗。requests __NEXT_DATA__ フォールバック: %s", page_url)
+        html = client.get_html(page_url)
+        if html:
+            next_data = client._extract_next_data(html)
+            if next_data:
+                match_data = (
+                    next_data.get("props", {}).get("pageProps", {}).get("match")
+                    or next_data.get("props", {}).get("pageProps", {}).get("matchData")
+                    or next_data.get("props", {}).get("pageProps")
+                )
+                if match_data:
+                    logger.info("requests __NEXT_DATA__ からマッチデータを取得しました")
+                    return match_data
 
     logger.error("マッチデータの取得に失敗しました: match_id=%s", match_id)
     return None
