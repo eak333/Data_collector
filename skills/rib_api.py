@@ -32,20 +32,53 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 定数
+# ---------------------------------------------------------------------------
 BASE_URL = "https://www.rib.gg"
 API_BASE = "https://www.rib.gg/api"
 
-# HTTPセッション設定
-DEFAULT_HEADERS: Dict[str, str] = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
-    "Referer": "https://www.rib.gg/",
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+# ─── ページナビゲーション用ヘッダー（HTML取得・ブラウザの「タブを開く」相当）───
+_PAGE_HEADERS: Dict[str, str] = {
+    "User-Agent":                _UA,
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language":           "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":           "gzip, deflate",
+    "Cache-Control":             "max-age=0",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua":                 '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "sec-ch-ua-mobile":          "?0",
+    "sec-ch-ua-platform":        '"Windows"',
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-Site":            "none",   # 直接入力 or 外部リンク遷移
+    "Sec-Fetch-User":            "?1",
 }
+
+# ─── 同一オリジンAPIリクエスト用ヘッダー（ページ内 fetch() 相当）───
+_API_HEADERS: Dict[str, str] = {
+    "User-Agent":       _UA,
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":  "gzip, deflate",
+    "Origin":           BASE_URL,
+    "Referer":          f"{BASE_URL}/",
+    "sec-ch-ua":        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest":   "empty",
+    "Sec-Fetch-Mode":   "cors",
+    "Sec-Fetch-Site":   "same-origin",
+}
+
+# 後方互換のため残す（外部からアクセスされている場合に備えて）
+DEFAULT_HEADERS = _PAGE_HEADERS
 
 REQUEST_TIMEOUT: int = 30       # 秒
 MAX_RETRIES: int = 3            # 最大リトライ回数
@@ -166,18 +199,57 @@ class RibGGClient:
     セッション管理・レート制限・リトライロジックをカプセル化します。
     """
 
-    def __init__(self, cache_dir: Optional[Path] = None) -> None:
+    def __init__(self, cache_dir: Optional[Path] = None, warmup: bool = True) -> None:
         """
         Args:
             cache_dir: 生JSONをキャッシュするディレクトリ。
                        None の場合はキャッシュを行いません。
+            warmup: True の場合、初期化時にホームページを訪問して
+                    セッションクッキーを取得します（ボット検出対策）。
         """
         self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        # セッションにベースヘッダーをセット（get_html/get_json で上書きする）
+        self.session.headers.update({
+            "User-Agent":       _UA,
+            "Accept-Language":  "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding":  "gzip, deflate",
+            "sec-ch-ua":        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        })
         self.cache_dir = cache_dir
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
         self._last_request_time: float = 0.0
+
+        if warmup:
+            self._warmup()
+
+    def _warmup(self) -> None:
+        """
+        ホームページを訪問してセッションクッキーを取得します。
+
+        rib.gg はボット検出のため、最初のリクエストでクッキーが
+        セットされていることを確認する場合があります。ホームページを
+        先に訪問することで、以降のリクエストが本物のブラウザに見えます。
+        """
+        try:
+            logger.info("セッション初期化: %s を訪問中...", BASE_URL)
+            resp = self.session.get(
+                BASE_URL,
+                headers=_PAGE_HEADERS,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+            self._last_request_time = time.time()
+            cookie_count = len(self.session.cookies)
+            logger.info(
+                "セッション初期化完了: status=%d, cookies=%d件",
+                resp.status_code, cookie_count,
+            )
+        except requests.exceptions.RequestException as e:
+            # ウォームアップ失敗は致命的ではないため警告のみ
+            logger.warning("セッション初期化に失敗（続行します）: %s", e)
 
     def _enforce_rate_limit(self) -> None:
         """リクエスト間のレート制限を強制します。"""
@@ -215,10 +287,17 @@ class RibGGClient:
 
         self._enforce_rate_limit()
 
+        # API リクエストヘッダー: Referer を呼び出し元URLのページに設定
+        # （ページ内の fetch() が送るヘッダーを再現）
+        api_headers = {
+            **_API_HEADERS,
+            "Referer": url.rsplit("/api/", 1)[0] + "/" if "/api/" in url else f"{BASE_URL}/",
+        }
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info("[%d/%d] GET %s", attempt, MAX_RETRIES, url)
-                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                response = self.session.get(url, headers=api_headers, timeout=REQUEST_TIMEOUT)
                 self._last_request_time = time.time()
 
                 if response.status_code == 429:
@@ -287,10 +366,19 @@ class RibGGClient:
         """
         self._enforce_rate_limit()
 
+        # HTML ページ取得ヘッダー: Sec-Fetch-Site を same-origin/cross-site で切り替える
+        parsed_target = urlparse(url)
+        is_same_origin = parsed_target.netloc in ("www.rib.gg", "rib.gg")
+        page_headers = {
+            **_PAGE_HEADERS,
+            "Sec-Fetch-Site": "same-origin" if is_same_origin else "cross-site",
+            "Referer": f"{BASE_URL}/",
+        }
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info("[%d/%d] GET HTML %s", attempt, MAX_RETRIES, url)
-                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                response = self.session.get(url, headers=page_headers, timeout=REQUEST_TIMEOUT)
                 self._last_request_time = time.time()
                 response.raise_for_status()
                 return response.text
@@ -450,6 +538,7 @@ def parse_series_id_from_url(url: str) -> Optional[str]:
 def fetch_match_data(
     client: RibGGClient,
     match_id: str,
+    original_url: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     個別マップ（マッチ）の詳細データを取得します。
@@ -460,12 +549,13 @@ def fetch_match_data(
       - 全Killイベント（タイムスタンプ・武器・座標）
       - プレイヤーとエージェントの情報
 
-    Priority 1: /api/match/{match_id}
-    Priority 2: /api/matches/{match_id}/events（イベント専用エンドポイント）
+    Priority 1: 内部REST APIエンドポイント（複数候補を順次試みる）
+    Priority 2: ページHTML の __NEXT_DATA__ JSONブロブ（original_url を優先使用）
 
     Args:
         client: RibGGClient インスタンス
         match_id: マッチID
+        original_url: ユーザーが渡した元URL。指定時は HTML フォールバックで使用。
 
     Returns:
         マッチデータのdict。失敗時はNone
@@ -482,8 +572,9 @@ def fetch_match_data(
             return data
 
     # Priority 2: ページHTMLの __NEXT_DATA__ からフォールバック
+    # original_url が指定されていればそちらを優先（正しいパスを保証）
     logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
-    page_url = f"{BASE_URL}/matches/{match_id}"
+    page_url = original_url or f"{BASE_URL}/matches/{match_id}"
     html = client.get_html(page_url)
     if html:
         next_data = client._extract_next_data(html)
@@ -528,7 +619,8 @@ def fetch_match_as_series_data(
     logger.info("matchタイプURL → シリーズデータ構築開始: match_id=%s", match_id)
 
     # ── Step 1: マッチデータを取得 ──
-    match_data = fetch_match_data(client, match_id)
+    # original_url を渡すことで、HTMLフォールバック時に正しいページパスを使う
+    match_data = fetch_match_data(client, match_id, original_url=original_url)
     if not match_data:
         # __NEXT_DATA__ をイベントページから直接試みる
         html = client.get_html(original_url)
