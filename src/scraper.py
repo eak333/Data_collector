@@ -27,9 +27,10 @@ from skills.rib_api import (
     extract_kill_events,
     extract_map_picks,
     extract_roster,
+    fetch_match_as_series_data,
     fetch_match_data,
     fetch_series_data,
-    parse_series_id_from_url,
+    parse_url_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -291,16 +292,33 @@ class VALORANTScraper:
         """
         logger.info("スクレイピング開始: %s", series_url)
 
-        # ── Step 1: シリーズIDの抽出 ──
-        series_id = parse_series_id_from_url(series_url)
-        if not series_id:
-            logger.error("シリーズIDの抽出に失敗しました")
+        # ── Step 1: URLからIDとタイプを抽出 ──
+        # 対応URL例:
+        #   https://www.rib.gg/series/12345              → ("12345", "series")
+        #   https://www.rib.gg/events/{slug}/matches/6244 → ("6244", "match")
+        url_info = parse_url_info(series_url)
+        if not url_info:
+            logger.error(
+                "URLからIDを抽出できませんでした: %s\n"
+                "対応URL形式: /series/{id} または /events/{slug}/matches/{id}",
+                series_url,
+            )
             return None
 
-        # ── Step 2: シリーズメタデータ取得 ──
-        series_data = fetch_series_data(self.client, series_id)
+        page_id, url_type = url_info
+        logger.info("URL解析結果: id=%s, type=%s", page_id, url_type)
+
+        # ── Step 2: URLタイプに応じてシリーズデータを取得 ──
+        if url_type == "series":
+            series_data = fetch_series_data(self.client, page_id)
+            series_id = page_id
+        else:
+            # match URL (/events/.../matches/{id}) → シリーズ相当データを構築
+            series_data = fetch_match_as_series_data(self.client, page_id, series_url)
+            series_id = page_id  # フォールバック：matchIDをシリーズIDとして扱う
+
         if not series_data:
-            logger.error("シリーズデータの取得に失敗しました")
+            logger.error("シリーズデータの取得に失敗しました (type=%s, id=%s)", url_type, page_id)
             return None
 
         self._save_raw_json(series_data, f"series_{series_id}.json")
@@ -319,10 +337,16 @@ class VALORANTScraper:
         all_rounds: List[Dict[str, Any]] = []
         all_kills: List[Dict[str, Any]] = []
 
+        # fetch_match_as_series_data() が合成した場合、元のマッチデータが
+        # series_data["_raw_match_data"] にキャッシュされているので再フェッチを避ける
+        raw_match_cache: Dict[str, Any] = {}
+        if series_data.get("_raw_match_data"):
+            raw_match_cache[page_id] = series_data["_raw_match_data"]
+
         for match_id in series_meta.match_ids:
             logger.info("マッチデータ取得中: match_id=%s", match_id)
 
-            match_data = fetch_match_data(self.client, match_id)
+            match_data = raw_match_cache.get(match_id) or fetch_match_data(self.client, match_id)
             if not match_data:
                 logger.warning("マッチ %s のデータ取得に失敗。スキップします", match_id)
                 continue

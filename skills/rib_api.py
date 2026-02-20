@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
-BASE_URL = "https://rib.gg"
-API_BASE = "https://rib.gg/api"
+BASE_URL = "https://www.rib.gg"
+API_BASE = "https://www.rib.gg/api"
 
 # HTTPセッション設定
 DEFAULT_HEADERS: Dict[str, str] = {
@@ -44,7 +44,7 @@ DEFAULT_HEADERS: Dict[str, str] = {
     ),
     "Accept": "application/json, text/html, */*",
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
-    "Referer": "https://rib.gg/",
+    "Referer": "https://www.rib.gg/",
 }
 
 REQUEST_TIMEOUT: int = 30       # 秒
@@ -386,28 +386,61 @@ def fetch_series_data(
     return None
 
 
-def parse_series_id_from_url(url: str) -> Optional[str]:
+def parse_url_info(url: str) -> Optional[Tuple[str, str]]:
     """
-    rib.gg のシリーズURLからシリーズIDを抽出します。
+    rib.gg の各種URLからIDとURLタイプを抽出します。
+
+    対応URLパターン:
+      /series/{id}                          → (id, "series")
+      /events/{slug}/matches/{id}           → (id, "match")
+      /matches/{id}                         → (id, "match")
+      /events/{slug}/series/{id}            → (id, "series")
 
     例:
-      "https://rib.gg/series/12345" → "12345"
-      "https://rib.gg/series/12345?tab=overview" → "12345"
+      "https://www.rib.gg/series/12345"                            → ("12345", "series")
+      "https://www.rib.gg/events/vct-2026-pacific-kickoff/matches/6244"
+                                                                   → ("6244", "match")
+      "https://www.rib.gg/matches/6244"                            → ("6244", "match")
 
     Args:
-        url: rib.gg のシリーズURL
+        url: rib.gg のURL（www あり・なし両対応）
 
     Returns:
-        シリーズID文字列。パース失敗時はNone
+        (id文字列, タイプ文字列) のタプル。パース失敗時はNone
     """
     parsed = urlparse(url)
-    # パス: /series/{id} または /series/{id}/...
-    match = re.search(r"/series/(\d+)", parsed.path)
-    if match:
-        return match.group(1)
+    path = parsed.path
 
-    logger.error("URLからシリーズIDを抽出できませんでした: %s", url)
+    # /series/{id}  または  /events/{slug}/series/{id}
+    m = re.search(r"/series/(\d+)", path)
+    if m:
+        return m.group(1), "series"
+
+    # /events/{slug}/matches/{id}  または  /matches/{id}
+    m = re.search(r"/matches/(\d+)", path)
+    if m:
+        return m.group(1), "match"
+
+    logger.error(
+        "URLからIDを抽出できませんでした: %s\n"
+        "対応パターン: /series/{id}, /events/{slug}/matches/{id}, /matches/{id}",
+        url,
+    )
     return None
+
+
+def parse_series_id_from_url(url: str) -> Optional[str]:
+    """
+    後方互換ラッパー。parse_url_info() を呼び出してIDのみを返します。
+
+    Args:
+        url: rib.gg のURL
+
+    Returns:
+        ID文字列（タイプを問わず）。パース失敗時はNone
+    """
+    result = parse_url_info(url)
+    return result[0] if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -437,23 +470,161 @@ def fetch_match_data(
     Returns:
         マッチデータのdict。失敗時はNone
     """
-    # Priority 1: マッチ詳細API
-    api_url = f"{API_BASE}/match/{match_id}"
-    data = client.get_json(api_url)
+    # Priority 1: /api/match/{match_id}
+    for api_url in [
+        f"{API_BASE}/match/{match_id}",
+        f"{API_BASE}/matches/{match_id}",
+        f"{API_BASE}/matches/{match_id}/events",
+    ]:
+        data = client.get_json(api_url)
+        if data:
+            logger.info("マッチデータを取得しました: match_id=%s (endpoint: %s)", match_id, api_url)
+            return data
 
-    if data:
-        logger.info("マッチデータを取得しました: match_id=%s", match_id)
-        return data
-
-    # Priority 2: 別エンドポイントを試みる
-    alt_url = f"{API_BASE}/matches/{match_id}/events"
-    data = client.get_json(alt_url)
-    if data:
-        logger.info("マッチイベントデータを取得しました (alt endpoint): match_id=%s", match_id)
-        return data
+    # Priority 2: ページHTMLの __NEXT_DATA__ からフォールバック
+    logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
+    page_url = f"{BASE_URL}/matches/{match_id}"
+    html = client.get_html(page_url)
+    if html:
+        next_data = client._extract_next_data(html)
+        if next_data:
+            match_data = (
+                next_data.get("props", {}).get("pageProps", {}).get("match")
+                or next_data.get("props", {}).get("pageProps", {}).get("matchData")
+                or next_data.get("props", {}).get("pageProps")
+            )
+            if match_data:
+                logger.info("__NEXT_DATA__ からマッチデータを取得しました: match_id=%s", match_id)
+                return match_data
 
     logger.error("マッチデータの取得に失敗しました: match_id=%s", match_id)
     return None
+
+
+def fetch_match_as_series_data(
+    client: RibGGClient,
+    match_id: str,
+    original_url: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    matchタイプのURLを起点として、シリーズ相当のデータを構築します。
+
+    /events/{slug}/matches/{id} 形式のURLが渡された場合:
+      1. /api/match/{id} からマッチデータを取得
+      2. マッチデータに含まれるシリーズ情報（series_id）を探す
+      3. シリーズ情報が見つかれば fetch_series_data() に委譲
+      4. 見つからなければマッチデータから合成したシリーズdictを返す
+
+    また、イベントページの __NEXT_DATA__ からシリーズIDを発見することも試みます。
+
+    Args:
+        client: RibGGClient インスタンス
+        match_id: URLから抽出したマッチID
+        original_url: ユーザーが渡した元URL（イベントページのパス解析に使用）
+
+    Returns:
+        シリーズデータ相当のdict（fetch_series_data と同形式）。失敗時はNone
+    """
+    logger.info("matchタイプURL → シリーズデータ構築開始: match_id=%s", match_id)
+
+    # ── Step 1: マッチデータを取得 ──
+    match_data = fetch_match_data(client, match_id)
+    if not match_data:
+        # __NEXT_DATA__ をイベントページから直接試みる
+        html = client.get_html(original_url)
+        if html:
+            next_data = client._extract_next_data(html)
+            if next_data:
+                match_data = (
+                    next_data.get("props", {}).get("pageProps", {}).get("match")
+                    or next_data.get("props", {}).get("pageProps", {}).get("matchData")
+                    or next_data.get("props", {}).get("pageProps")
+                )
+                if match_data:
+                    logger.info("元URLの __NEXT_DATA__ からマッチデータを取得しました")
+
+    if not match_data:
+        logger.error("マッチデータを取得できませんでした: match_id=%s", match_id)
+        return None
+
+    # ── Step 2: マッチデータ内のシリーズIDを探す ──
+    series_id_from_match = (
+        match_data.get("seriesId")
+        or match_data.get("series_id")
+        or match_data.get("series", {}).get("id") if isinstance(match_data.get("series"), dict) else None
+    )
+
+    if series_id_from_match:
+        logger.info("マッチデータからシリーズID=%s を発見。シリーズAPIに委譲します", series_id_from_match)
+        series_data = fetch_series_data(client, str(series_id_from_match))
+        if series_data:
+            return series_data
+
+    # ── Step 3: イベントページから __NEXT_DATA__ を取得してシリーズ情報を探す ──
+    parsed_url = urlparse(original_url)
+    # /events/{slug} の部分だけ取り出してページを取得
+    event_path_match = re.match(r"(/events/[^/]+)", parsed_url.path)
+    if event_path_match:
+        event_page_url = f"{BASE_URL}{event_path_match.group(1)}"
+        logger.info("イベントページから __NEXT_DATA__ を探します: %s", event_page_url)
+        html = client.get_html(event_page_url)
+        if html:
+            next_data = client._extract_next_data(html)
+            if next_data:
+                # イベントページにシリーズリストが含まれている場合
+                event_data = (
+                    next_data.get("props", {}).get("pageProps", {}).get("event")
+                    or next_data.get("props", {}).get("pageProps", {}).get("eventData")
+                )
+                if event_data:
+                    series_list = event_data.get("series") or event_data.get("matches") or []
+                    for s in series_list:
+                        if str(s.get("id")) == match_id:
+                            logger.info("イベントページからシリーズデータを発見しました")
+                            return s
+
+    # ── Step 4: 合成シリーズdictを作成（フォールバック）──
+    # マッチデータから直接読み取れる情報でシリーズ相当のdictを構築
+    logger.info("シリーズデータが見つからないため、マッチデータから合成します")
+
+    teams = match_data.get("teams") or []
+    event_info = match_data.get("event") or match_data.get("tournament") or {}
+    event_name = (
+        event_info.get("name")
+        or event_info.get("shortName")
+        or _slug_to_name(parsed_url.path)  # URLスラグから大会名を推定
+    )
+
+    # マッチデータをシリーズ形式にラップ
+    synthetic_series: Dict[str, Any] = {
+        "id":             match_id,
+        "tournamentName": event_name,
+        "date":           match_data.get("date") or match_data.get("createdAt") or "",
+        "teams":          teams,
+        "matches":        [{"id": match_id}],
+        "mapBans":        match_data.get("mapBans") or [],
+        # 元のマッチデータも保持しておく（scraper側で活用できるよう）
+        "_raw_match_data": match_data,
+    }
+
+    logger.info(
+        "合成シリーズdictを作成: event=%s, teams=%d",
+        event_name, len(teams)
+    )
+    return synthetic_series
+
+
+def _slug_to_name(url_path: str) -> str:
+    """
+    URLスラグから人間が読める大会名を生成するヘルパー。
+
+    例: "/events/vct-2026-pacific-kickoff/matches/6244" → "Vct 2026 Pacific Kickoff"
+    """
+    m = re.search(r"/events/([^/]+)", url_path)
+    if m:
+        slug = m.group(1)
+        return " ".join(word.capitalize() for word in slug.split("-"))
+    return "Unknown Event"
 
 
 # ---------------------------------------------------------------------------
