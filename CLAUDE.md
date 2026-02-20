@@ -2,11 +2,12 @@
 
 ## 概要 (Overview)
 
-このプロジェクトは **rib.gg** からVALORANTの試合データをスクレイピングし、
+このプロジェクトは **rib.gg** からVALORANTの試合データをWebクローリングで収集し、
 「Kill Pace（キルペース）」や「武器使用率」を分析するデータパイプラインです。
 
-rib.gg は Next.js 製アプリケーションのため、`__NEXT_DATA__` JSONブロブや
-内部APIエンドポイントを優先的にリバースエンジニアリングします。
+rib.gg は Next.js 製アプリケーションであり、Envoy プロキシによる TLS フィンガープリント
+検査でボット検出を行います。そのため **Playwright Chromium ブラウザ** を使った
+実ブラウザクローリングを採用し、`__NEXT_DATA__` JSONブロブからデータを抽出します。
 
 ---
 
@@ -18,13 +19,13 @@ Data_collector/
 ├── requirements.txt       # Python依存関係
 ├── main.py                # エントリポイント
 ├── skills/
-│   └── rib_api.py         # rib.gg 専用APIクライアント・データ取得ロジック
+│   └── rib_api.py         # rib.gg 専用ブラウザクローラー・データ抽出ロジック
 ├── src/
 │   ├── scraper.py         # ラウンドデータの反復収集
 │   ├── analyzer.py        # Kill Delta / 武器統計の計算
 │   └── database.py        # SQLite スキーマ定義・データ挿入
 └── data/
-    ├── raw/               # APIから取得した生JSONデータ
+    ├── raw/               # クローリングで取得した生JSONデータ
     └── processed/         # 処理済みCSV / SQLiteファイル
 ```
 
@@ -36,14 +37,18 @@ Data_collector/
 # 依存関係のインストール
 pip install -r requirements.txt
 
-# スクレイパーの実行（特定シリーズURLを引数で渡す）
-python main.py --url "https://rib.gg/series/<series_id>"
+# Playwright Chromium ブラウザのインストール（初回必須）
+playwright install chromium
 
-# データベースのみ初期化
-python -m src.database --init
+# スクレイパーの実行（シリーズURLまたはマッチURLを指定）
+python main.py --url "https://www.rib.gg/series/<series_id>"
+python main.py --url "https://www.rib.gg/events/<event-slug>/matches/<match_id>"
 
-# 分析レポートの出力
-python -m src.analyzer --report
+# 詳細ログを有効化
+python main.py --url "https://www.rib.gg/series/<series_id>" --verbose
+
+# 分析レポートの出力（既存DBから）
+python main.py --report --db data/processed/valorant_matches.db
 ```
 
 ---
@@ -59,11 +64,13 @@ python -m src.analyzer --report
 - ログレベル: `DEBUG` (詳細), `INFO` (進捗), `WARNING` (軽微な問題), `ERROR` (致命的エラー)
 - フォーマット: `%(asctime)s [%(levelname)s] %(name)s: %(message)s`
 
-### ネットワーク
-- 全HTTPリクエストに `requests.Session` を使用すること
-- リトライロジック（最大3回、指数バックオフ）を実装すること
-- User-Agent ヘッダーを適切に設定し、レート制限を遵守すること
-- タイムアウトは常に明示的に設定すること（デフォルト: 30秒）
+### Webクローリング（Playwright優先）
+- **データ取得は必ず Playwright Chromium ブラウザを経由すること**
+- `RibGGClient(use_browser=True)` がデフォルト。`PlaywrightBrowser` が自動起動する
+- Playwright が未インストールの場合のみ `requests` にフォールバックする
+  （ただしrib.ggのボット検出によりブロックされる可能性が高い）
+- ページ訪問後は `__NEXT_DATA__` を JS 評価で直接取得すること（`get_next_data()`）
+- `__NEXT_DATA__` にデータが含まれない場合は APIインターセプト（`intercept_api()`）を使用
 
 ### データ処理
 - DB挿入前に必ず `pandas.DataFrame` を経由して中間処理を行うこと
@@ -71,7 +78,7 @@ python -m src.analyzer --report
 - タイムスタンプは秒単位（float）で統一すること
 
 ### エラー処理
-- ネットワークエラー: `requests.exceptions.RequestException` をキャッチしてリトライ
+- ブラウザエラー: Playwright 例外をキャッチしてログ出力し、`None` を返す
 - パースエラー: `KeyError`, `TypeError` をキャッチして警告ログを出力し、スキップ
 - DB エラー: `sqlalchemy.exc.SQLAlchemyError` をキャッチしてロールバック
 
@@ -80,19 +87,52 @@ python -m src.analyzer --report
 ## アーキテクチャ概要 (Architecture)
 
 ```
-[rib.gg API / __NEXT_DATA__]
+[rib.gg ページ（Next.js SSR）]
+          |
+          | Playwright Chromium ブラウザ（実TLSフィンガープリント）
+          v
+  skills/rib_api.py
+    ├── PlaywrightBrowser       ← Chromium起動・セッション管理
+    │     ├── get_next_data()   ← __NEXT_DATA__ JS評価（PRIMARY）
+    │     └── intercept_api()   ← APIレスポンスネットワーク傍受（SECONDARY）
+    ├── fetch_series_data()     ← シリーズメタデータ取得
+    ├── fetch_match_data()      ← マッチ詳細取得（ラウンド・Kill）
+    ├── fetch_match_as_series_data() ← matchURL → シリーズ構造変換
+    ├── extract_kill_events()   ← Killイベント正規化
+    └── WEAPON_MAP              ← 武器ID → 武器名マッピング
           |
           v
-  skills/rib_api.py         ← APIフェッチ + 武器IDマッピング + Killイベント抽出
+    src/scraper.py              ← ラウンド反復・生データ収集・data/raw/ に保存
           |
           v
-    src/scraper.py           ← ラウンド反復・生データ収集・data/raw/ に保存
+    src/analyzer.py             ← Kill Delta計算・武器統計集計・DataFrame生成
           |
           v
-    src/analyzer.py          ← Kill Delta計算・武器統計集計・DataFrame生成
-          |
-          v
-    src/database.py          ← SQLite スキーマ初期化・DataFrame から一括挿入
+    src/database.py             ← SQLite スキーマ初期化・DataFrame から一括挿入
+```
+
+---
+
+## データ取得戦略 (Data Retrieval Strategy)
+
+rib.gg は Envoy プロキシで **TLS フィンガープリント（JA3/JA4）** を検査しており、
+`requests` / `urllib3` などの Python HTTPクライアントは 403 (`x-deny-reason: host_not_allowed`)
+でブロックされます。
+
+### 採用戦略: Playwright 実ブラウザクローリング
+
+| 優先度 | 手段 | 説明 |
+|---|---|---|
+| PRIMARY | `get_next_data()` | Playwright で該当URLを訪問し、`__NEXT_DATA__` を JS で評価取得 |
+| SECONDARY | `intercept_api()` | ページロード時のAPIレスポンスをネットワーク傍受 |
+| FALLBACK | `requests` | Playwright未インストール時のみ（ブロックされる可能性大） |
+
+### 対応URLパターン
+
+```
+https://www.rib.gg/series/{series_id}
+https://www.rib.gg/events/{event-slug}/matches/{match_id}
+https://www.rib.gg/matches/{match_id}
 ```
 
 ---
@@ -134,37 +174,19 @@ python -m src.analyzer --report
 | id | INTEGER (PK) | イベントDB ID |
 | round_id | INTEGER (FK) | roundsテーブル参照 |
 | timestamp | REAL | ラウンド開始からの経過秒数 |
-| killer_id | TEXT (FK) | killersプレイヤーID |
+| killer_id | TEXT (FK) | killerプレイヤーID |
 | victim_id | TEXT (FK) | victimプレイヤーID |
-| weapon_name | TEXT | 武器名（日本語変換済み） |
+| weapon_name | TEXT | 武器名（WEAPON_MAP変換済み） |
 | time_delta | REAL | 前killからの経過秒数（Kill Pace） |
 | location_x | REAL | X座標（任意） |
 | location_y | REAL | Y座標（任意） |
 
 ---
 
-## rib.gg APIエンドポイント（リバースエンジニアリング済み）
-
-```
-# シリーズ詳細（マップ一覧・チーム情報）
-GET https://rib.gg/api/series/{series_id}
-
-# 特定マップの試合詳細（ラウンド・Killイベント）
-GET https://rib.gg/api/match/{match_id}
-
-# プレイヤー情報
-GET https://rib.gg/api/players/{player_id}
-```
-
-> **注意:** エンドポイントはリバースエンジニアリングに基づくため、
-> サイト更新により変更される可能性があります。
-> `__NEXT_DATA__` フォールバックも実装すること。
-
----
-
 ## 注意事項 (Important Notes)
 
-1. **レート制限:** rib.gg のTOS（利用規約）を遵守し、リクエスト間に適切な遅延を設けること（最低1秒）
-2. **データキャッシュ:** 同一URLへの重複リクエストを避けるため、`data/raw/` にJSONをキャッシュすること
-3. **武器マッピング:** 武器IDは整数値で返されるため、必ず `WEAPON_MAP` で名前に変換すること
-4. **タイムスタンプ精度:** Kill タイムスタンプはミリ秒で取得される場合があるため、秒変換時は `/ 1000` を使用すること
+1. **初回セットアップ:** `playwright install chromium` を必ず実行すること
+2. **レート制限:** rib.gg のTOS（利用規約）を遵守し、リクエスト間に適切な遅延を設けること（最低1.5秒）
+3. **データキャッシュ:** 同一URLへの重複リクエストを避けるため、`data/raw/` にJSONをキャッシュすること
+4. **武器マッピング:** 武器IDは整数値で返されるため、必ず `WEAPON_MAP` で名前に変換すること
+5. **タイムスタンプ精度:** Kill タイムスタンプはミリ秒で取得される場合があるため、秒変換時は `/ 1000` を使用すること

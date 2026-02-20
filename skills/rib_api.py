@@ -1,16 +1,21 @@
 """
 skills/rib_api.py
 =================
-rib.gg 専用APIクライアント。
+rib.gg 専用Webクローラー兼データ抽出クライアント。
 
 主要機能:
-  1. rib.gg の内部APIまたは __NEXT_DATA__ からJSON を取得
-  2. 武器ID → 武器名へのマッピング (WEAPON_MAP)
-  3. Killイベント（タイムスタンプ・武器・座標）の抽出
+  1. Playwright Chromium ブラウザによる実ブラウザクローリング（ボット検出回避）
+  2. __NEXT_DATA__ JSONブロブからのデータ抽出（Next.js SSR）
+  3. 武器ID → 武器名へのマッピング (WEAPON_MAP)
+  4. Killイベント（タイムスタンプ・武器・座標）の抽出
 
-rib.gg は Next.js 製アプリケーションのため、以下の優先順位でデータ取得を試みます:
-  Priority 1: 内部REST APIエンドポイント (/api/series/{id}, /api/match/{id})
-  Priority 2: ページHTML内の <script id="__NEXT_DATA__"> JSONブロブのパース
+データ取得戦略（優先順位順）:
+  Priority 1: Playwright Chromium ブラウザ（__NEXT_DATA__ JS評価）
+              → TLSフィンガープリント偽装によりボット検出を回避
+  Priority 2: Playwright APIインターセプト
+              → ページロード時のAPIレスポンスをネットワーク傍受
+  Fallback:   requests（Playwright未インストール時のみ）
+              → rib.gg のEnvoyプロキシによりブロックされる可能性が高い
 """
 
 import json
@@ -658,8 +663,10 @@ def fetch_series_data(
       - マップBan/Pickの履歴
       - 含まれるMatch（マップ）のIDリスト
 
-    Priority 1: /api/series/{series_id} エンドポイント
-    Priority 2: /series/{series_id} ページの __NEXT_DATA__
+    取得戦略（Playwright優先）:
+      Primary:   Playwright ブラウザで /series/{id} を訪問 → __NEXT_DATA__ を取得
+      Secondary: Playwright APIインターセプト（__NEXT_DATA__ にシリーズなし時）
+      Fallback:  requests（Playwright未インストール時）
 
     Args:
         client: RibGGClient インスタンス
@@ -668,40 +675,112 @@ def fetch_series_data(
     Returns:
         シリーズデータのdict。失敗時はNone
     """
-    # Priority 1: API直接取得を試みる
-    api_url = f"{API_BASE}/series/{series_id}"
-    data = client.get_json(api_url)
-
-    if data:
-        logger.info("シリーズデータをAPIから取得しました: series_id=%s", series_id)
-        return data
-
-    # Priority 2: ブラウザ / HTML から __NEXT_DATA__ を取得
     page_url = f"{BASE_URL}/series/{series_id}"
-    logger.info("APIが失敗。__NEXT_DATA__ からフォールバックします...")
 
-    def _extract_series_from_next_data(nd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _dig_series(nd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return nd.get("props", {}).get("pageProps", {}).get("series")
 
     if client._browser:
+        # PRIMARY: Playwright ブラウザで __NEXT_DATA__ を取得
+        logger.info("ブラウザでシリーズページをクローリングします: %s", page_url)
         next_data = client._browser.get_next_data(page_url)
         if next_data:
-            series = _extract_series_from_next_data(next_data)
+            series = _dig_series(next_data)
             if series:
                 logger.info("ブラウザ __NEXT_DATA__ からシリーズデータを取得しました")
                 return series
+
+        # SECONDARY: __NEXT_DATA__ にシリーズデータなし → APIインターセプト
+        logger.info("__NEXT_DATA__ にシリーズデータなし。APIインターセプトを試みます...")
+        api_data = client._browser.intercept_api(page_url)
+        if api_data:
+            logger.info("APIインターセプトでシリーズデータを取得しました")
+            return api_data
+
     else:
+        # FALLBACK (Playwright 未インストール): requests による取得
+        logger.warning(
+            "Playwrightブラウザが利用できません。requestsでフォールバックします"
+            "（rib.gg のボット検出によりブロックされる可能性があります）"
+        )
+        api_url = f"{API_BASE}/series/{series_id}"
+        data = client.get_json(api_url)
+        if data:
+            logger.info("requestsでAPIからシリーズデータを取得しました: series_id=%s", series_id)
+            return data
+
         html = client.get_html(page_url)
         if html:
             next_data = client._extract_next_data(html)
             if next_data:
-                series = _extract_series_from_next_data(next_data)
+                series = _dig_series(next_data)
                 if series:
-                    logger.info("__NEXT_DATA__ からシリーズデータを取得しました")
+                    logger.info("requests __NEXT_DATA__ からシリーズデータを取得しました")
                     return series
 
     logger.error("シリーズデータの取得に失敗しました: series_id=%s", series_id)
     return None
+
+
+# ---------------------------------------------------------------------------
+# __NEXT_DATA__ 掘り出しヘルパー
+# ---------------------------------------------------------------------------
+
+def _dig_match_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    __NEXT_DATA__ 構造からマッチデータを掘り出すヘルパー。
+
+    rib.gg のページ構造バリエーションに対応:
+      props.pageProps.match           (通常の試合ページ)
+      props.pageProps.matchData       (旧バージョン)
+      props.pageProps.data.match      (ネスト構造)
+      props.pageProps                 (rounds/events/players が直下にある場合)
+    """
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    match = (
+        page_props.get("match")
+        or page_props.get("matchData")
+        or (page_props.get("data") or {}).get("match")
+    )
+    if match:
+        return match
+    # pageProps 直下にラウンド等が含まれる場合
+    if any(k in page_props for k in ("rounds", "events", "players", "killEvents")):
+        return page_props
+    return None
+
+
+def _build_synthetic_series(
+    match_data: Dict[str, Any],
+    match_id: str,
+    original_url: str,
+) -> Dict[str, Any]:
+    """
+    マッチデータからシリーズ相当のdictを合成するヘルパー。
+
+    シリーズAPIが利用できない場合に、マッチデータに含まれる
+    チーム・イベント情報からシリーズ構造を再現します。
+    """
+    parsed_path = urlparse(original_url).path
+    teams = match_data.get("teams") or []
+    event_info = match_data.get("event") or match_data.get("tournament") or {}
+    event_name = (
+        event_info.get("name")
+        or event_info.get("shortName")
+        or _slug_to_name(parsed_path)
+    )
+    logger.info(
+        "合成シリーズdictを作成: event=%s, teams=%d", event_name, len(teams)
+    )
+    return {
+        "id":              match_id,
+        "tournamentName":  event_name,
+        "date":            match_data.get("date") or match_data.get("createdAt") or "",
+        "teams":           teams,
+        "matches":         [{"id": match_id}],
+        "mapBans":         match_data.get("mapBans") or [],
+        "_raw_match_data": match_data,
+    }
 
 
 def parse_url_info(url: str) -> Optional[Tuple[str, str]]:
@@ -779,64 +858,60 @@ def fetch_match_data(
       - 全Killイベント（タイムスタンプ・武器・座標）
       - プレイヤーとエージェントの情報
 
-    Priority 1: 内部REST APIエンドポイント（複数候補を順次試みる）
-    Priority 2: ページHTML の __NEXT_DATA__ JSONブロブ（original_url を優先使用）
+    取得戦略（Playwright優先）:
+      Primary:   Playwright ブラウザで original_url（または /matches/{id}）を訪問
+                 → __NEXT_DATA__ を JS 評価で直接取得（_dig_match_from_next_data）
+      Secondary: Playwright APIインターセプト（__NEXT_DATA__ にマッチデータなし時）
+      Fallback:  requests（Playwright未インストール時）
 
     Args:
         client: RibGGClient インスタンス
         match_id: マッチID
-        original_url: ユーザーが渡した元URL。指定時は HTML フォールバックで使用。
+        original_url: ユーザーが渡した元URL。指定時はそちらを優先して訪問。
 
     Returns:
         マッチデータのdict。失敗時はNone
     """
-    # Priority 1: /api/match/{match_id}
-    for api_url in [
-        f"{API_BASE}/match/{match_id}",
-        f"{API_BASE}/matches/{match_id}",
-        f"{API_BASE}/matches/{match_id}/events",
-    ]:
-        data = client.get_json(api_url)
-        if data:
-            logger.info("マッチデータを取得しました: match_id=%s (endpoint: %s)", match_id, api_url)
-            return data
-
-    # Priority 2: Playwright ブラウザ経由で __NEXT_DATA__ を取得
-    # original_url が指定されていればそちらを使う（正しいページパスを保証）
+    # original_url が指定されていればそちらを使う（イベントページの正確なパスを保証）
     page_url = original_url or f"{BASE_URL}/matches/{match_id}"
 
     if client._browser:
-        # 2a: __NEXT_DATA__ を JavaScript で直接取得（最優先・高速）
-        logger.info("ブラウザで __NEXT_DATA__ を取得します: %s", page_url)
+        # PRIMARY: Playwright ブラウザで __NEXT_DATA__ を取得
+        logger.info("ブラウザでマッチページをクローリングします: %s", page_url)
         next_data = client._browser.get_next_data(page_url)
         if next_data:
-            match_data = (
-                next_data.get("props", {}).get("pageProps", {}).get("match")
-                or next_data.get("props", {}).get("pageProps", {}).get("matchData")
-                or next_data.get("props", {}).get("pageProps")
-            )
+            match_data = _dig_match_from_next_data(next_data)
             if match_data:
                 logger.info("ブラウザ __NEXT_DATA__ からマッチデータを取得しました")
                 return match_data
 
-        # 2b: ページ内APIコールをネットワーク傍受（__NEXT_DATA__ に含まれない場合）
-        logger.info("__NEXT_DATA__ にデータなし。APIインターセプトを試みます...")
+        # SECONDARY: __NEXT_DATA__ にマッチデータなし → APIインターセプト
+        logger.info("__NEXT_DATA__ にマッチデータなし。APIインターセプトを試みます...")
         api_data = client._browser.intercept_api(page_url)
         if api_data:
             logger.info("APIインターセプトでマッチデータを取得しました")
             return api_data
+
     else:
-        # Playwright 未使用時: requests でHTMLフォールバック
-        logger.info("APIが失敗。requests __NEXT_DATA__ フォールバック: %s", page_url)
+        # FALLBACK (Playwright 未インストール): requests による取得
+        logger.warning(
+            "Playwrightブラウザが利用できません。requestsでフォールバックします"
+            "（rib.gg のボット検出によりブロックされる可能性があります）"
+        )
+        for api_url in [
+            f"{API_BASE}/match/{match_id}",
+            f"{API_BASE}/matches/{match_id}",
+        ]:
+            data = client.get_json(api_url)
+            if data:
+                logger.info("requestsでAPIからマッチデータを取得しました: %s", api_url)
+                return data
+
         html = client.get_html(page_url)
         if html:
             next_data = client._extract_next_data(html)
             if next_data:
-                match_data = (
-                    next_data.get("props", {}).get("pageProps", {}).get("match")
-                    or next_data.get("props", {}).get("pageProps", {}).get("matchData")
-                    or next_data.get("props", {}).get("pageProps")
-                )
+                match_data = _dig_match_from_next_data(next_data)
                 if match_data:
                     logger.info("requests __NEXT_DATA__ からマッチデータを取得しました")
                     return match_data
@@ -853,110 +928,51 @@ def fetch_match_as_series_data(
     """
     matchタイプのURLを起点として、シリーズ相当のデータを構築します。
 
-    /events/{slug}/matches/{id} 形式のURLが渡された場合:
-      1. /api/match/{id} からマッチデータを取得
-      2. マッチデータに含まれるシリーズ情報（series_id）を探す
-      3. シリーズ情報が見つかれば fetch_series_data() に委譲
-      4. 見つからなければマッチデータから合成したシリーズdictを返す
+    /events/{slug}/matches/{id} 形式のURLが渡された場合、ブラウザで
+    そのページを訪問して __NEXT_DATA__ からマッチデータを一括取得し、
+    シリーズ相当のdictを合成して返します。
 
-    また、イベントページの __NEXT_DATA__ からシリーズIDを発見することも試みます。
+    処理フロー:
+      1. fetch_match_data() でマッチデータを取得（Playwright PRIMARY）
+      2. マッチデータ内にシリーズIDが含まれる場合は fetch_series_data() に委譲
+      3. 見つからなければ _build_synthetic_series() でシリーズdictを合成
 
     Args:
         client: RibGGClient インスタンス
         match_id: URLから抽出したマッチID
-        original_url: ユーザーが渡した元URL（イベントページのパス解析に使用）
+        original_url: ユーザーが渡した元URL（ブラウザクローリングに使用）
 
     Returns:
         シリーズデータ相当のdict（fetch_series_data と同形式）。失敗時はNone
     """
     logger.info("matchタイプURL → シリーズデータ構築開始: match_id=%s", match_id)
 
-    # ── Step 1: マッチデータを取得 ──
-    # original_url を渡すことで、HTMLフォールバック時に正しいページパスを使う
+    # ── Step 1: original_url をブラウザで訪問してマッチデータを取得 ──
     match_data = fetch_match_data(client, match_id, original_url=original_url)
-    if not match_data:
-        # __NEXT_DATA__ をイベントページから直接試みる
-        html = client.get_html(original_url)
-        if html:
-            next_data = client._extract_next_data(html)
-            if next_data:
-                match_data = (
-                    next_data.get("props", {}).get("pageProps", {}).get("match")
-                    or next_data.get("props", {}).get("pageProps", {}).get("matchData")
-                    or next_data.get("props", {}).get("pageProps")
-                )
-                if match_data:
-                    logger.info("元URLの __NEXT_DATA__ からマッチデータを取得しました")
-
     if not match_data:
         logger.error("マッチデータを取得できませんでした: match_id=%s", match_id)
         return None
 
     # ── Step 2: マッチデータ内のシリーズIDを探す ──
+    series_obj = match_data.get("series")
     series_id_from_match = (
         match_data.get("seriesId")
         or match_data.get("series_id")
-        or match_data.get("series", {}).get("id") if isinstance(match_data.get("series"), dict) else None
+        or (series_obj.get("id") if isinstance(series_obj, dict) else None)
     )
 
     if series_id_from_match:
-        logger.info("マッチデータからシリーズID=%s を発見。シリーズAPIに委譲します", series_id_from_match)
+        logger.info(
+            "マッチデータからシリーズID=%s を発見。fetch_series_data に委譲します",
+            series_id_from_match,
+        )
         series_data = fetch_series_data(client, str(series_id_from_match))
         if series_data:
             return series_data
 
-    # ── Step 3: イベントページから __NEXT_DATA__ を取得してシリーズ情報を探す ──
-    parsed_url = urlparse(original_url)
-    # /events/{slug} の部分だけ取り出してページを取得
-    event_path_match = re.match(r"(/events/[^/]+)", parsed_url.path)
-    if event_path_match:
-        event_page_url = f"{BASE_URL}{event_path_match.group(1)}"
-        logger.info("イベントページから __NEXT_DATA__ を探します: %s", event_page_url)
-        html = client.get_html(event_page_url)
-        if html:
-            next_data = client._extract_next_data(html)
-            if next_data:
-                # イベントページにシリーズリストが含まれている場合
-                event_data = (
-                    next_data.get("props", {}).get("pageProps", {}).get("event")
-                    or next_data.get("props", {}).get("pageProps", {}).get("eventData")
-                )
-                if event_data:
-                    series_list = event_data.get("series") or event_data.get("matches") or []
-                    for s in series_list:
-                        if str(s.get("id")) == match_id:
-                            logger.info("イベントページからシリーズデータを発見しました")
-                            return s
-
-    # ── Step 4: 合成シリーズdictを作成（フォールバック）──
-    # マッチデータから直接読み取れる情報でシリーズ相当のdictを構築
-    logger.info("シリーズデータが見つからないため、マッチデータから合成します")
-
-    teams = match_data.get("teams") or []
-    event_info = match_data.get("event") or match_data.get("tournament") or {}
-    event_name = (
-        event_info.get("name")
-        or event_info.get("shortName")
-        or _slug_to_name(parsed_url.path)  # URLスラグから大会名を推定
-    )
-
-    # マッチデータをシリーズ形式にラップ
-    synthetic_series: Dict[str, Any] = {
-        "id":             match_id,
-        "tournamentName": event_name,
-        "date":           match_data.get("date") or match_data.get("createdAt") or "",
-        "teams":          teams,
-        "matches":        [{"id": match_id}],
-        "mapBans":        match_data.get("mapBans") or [],
-        # 元のマッチデータも保持しておく（scraper側で活用できるよう）
-        "_raw_match_data": match_data,
-    }
-
-    logger.info(
-        "合成シリーズdictを作成: event=%s, teams=%d",
-        event_name, len(teams)
-    )
-    return synthetic_series
+    # ── Step 3: 合成シリーズdictを作成（シリーズIDが見つからない場合） ──
+    logger.info("シリーズIDが見つからないため、マッチデータから合成シリーズdictを作成します")
+    return _build_synthetic_series(match_data, match_id, original_url)
 
 
 def _slug_to_name(url_path: str) -> str:
