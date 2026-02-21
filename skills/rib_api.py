@@ -677,15 +677,12 @@ def fetch_series_data(
     """
     page_url = f"{BASE_URL}/series/{series_id}"
 
-    def _dig_series(nd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return nd.get("props", {}).get("pageProps", {}).get("series")
-
     if client._browser:
         # PRIMARY: Playwright ブラウザで __NEXT_DATA__ を取得
         logger.info("ブラウザでシリーズページをクローリングします: %s", page_url)
         next_data = client._browser.get_next_data(page_url)
         if next_data:
-            series = _dig_series(next_data)
+            series = _dig_series_from_next_data(next_data)
             if series:
                 logger.info("ブラウザ __NEXT_DATA__ からシリーズデータを取得しました")
                 return series
@@ -713,7 +710,7 @@ def fetch_series_data(
         if html:
             next_data = client._extract_next_data(html)
             if next_data:
-                series = _dig_series(next_data)
+                series = _dig_series_from_next_data(next_data)
                 if series:
                     logger.info("requests __NEXT_DATA__ からシリーズデータを取得しました")
                     return series
@@ -737,6 +734,7 @@ def _dig_match_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, A
       props.pageProps                 (rounds/events/players が直下にある場合)
     """
     page_props = next_data.get("props", {}).get("pageProps", {})
+    logger.debug("__NEXT_DATA__ pageProps keys: %s", list(page_props.keys()))
     match = (
         page_props.get("match")
         or page_props.get("matchData")
@@ -748,6 +746,27 @@ def _dig_match_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, A
     if any(k in page_props for k in ("rounds", "events", "players", "killEvents")):
         return page_props
     return None
+
+
+def _dig_series_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    __NEXT_DATA__ 構造からシリーズデータを掘り出すヘルパー。
+
+    rib.gg の /events/{slug}/matches/{id} ページでは、
+    pageProps.series にシリーズ全体（チーム・マッチ一覧・マップBan/Pick等）が
+    格納されることが多い。
+
+    対応バリエーション:
+      props.pageProps.series          (通常のシリーズ・イベント試合ページ)
+      props.pageProps.seriesData      (旧バージョン)
+      props.pageProps.data.series     (ネスト構造)
+    """
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    return (
+        page_props.get("series")
+        or page_props.get("seriesData")
+        or (page_props.get("data") or {}).get("series")
+    )
 
 
 def _build_synthetic_series(
@@ -947,32 +966,75 @@ def fetch_match_as_series_data(
     """
     logger.info("matchタイプURL → シリーズデータ構築開始: match_id=%s", match_id)
 
-    # ── Step 1: original_url をブラウザで訪問してマッチデータを取得 ──
-    match_data = fetch_match_data(client, match_id, original_url=original_url)
-    if not match_data:
-        logger.error("マッチデータを取得できませんでした: match_id=%s", match_id)
-        return None
+    if client._browser:
+        # ── ブラウザで original_url を1回だけ訪問 ──
+        logger.info("ブラウザで %s をクローリングします", original_url)
+        next_data = client._browser.get_next_data(original_url)
 
-    # ── Step 2: マッチデータ内のシリーズIDを探す ──
-    series_obj = match_data.get("series")
-    series_id_from_match = (
-        match_data.get("seriesId")
-        or match_data.get("series_id")
-        or (series_obj.get("id") if isinstance(series_obj, dict) else None)
-    )
+        if next_data:
+            page_props = next_data.get("props", {}).get("pageProps", {})
+            logger.debug("pageProps keys: %s", list(page_props.keys()))
 
-    if series_id_from_match:
+            # Step 1: series キーを最初に確認
+            # /events/{slug}/matches/{id} ページは pageProps.series にシリーズデータを持つことが多い
+            series = _dig_series_from_next_data(next_data)
+            if series:
+                logger.info("__NEXT_DATA__ からシリーズデータを直接取得しました")
+                return series
+
+            # Step 2: match キーを確認
+            match_data = _dig_match_from_next_data(next_data)
+            if match_data:
+                series_obj = match_data.get("series")
+                series_id_from_match = (
+                    match_data.get("seriesId")
+                    or match_data.get("series_id")
+                    or (series_obj.get("id") if isinstance(series_obj, dict) else None)
+                )
+                if series_id_from_match:
+                    logger.info(
+                        "マッチデータからシリーズID=%s を発見。fetch_series_data に委譲します",
+                        series_id_from_match,
+                    )
+                    series_data = fetch_series_data(client, str(series_id_from_match))
+                    if series_data:
+                        return series_data
+                return _build_synthetic_series(match_data, match_id, original_url)
+
+        # __NEXT_DATA__ に有効なデータなし → APIインターセプト
         logger.info(
-            "マッチデータからシリーズID=%s を発見。fetch_series_data に委譲します",
-            series_id_from_match,
+            "__NEXT_DATA__ に有効なデータなし。APIインターセプトを試みます: %s", original_url
         )
-        series_data = fetch_series_data(client, str(series_id_from_match))
-        if series_data:
-            return series_data
+        api_data = client._browser.intercept_api(original_url)
+        if api_data:
+            logger.info("APIインターセプトからデータを取得しました")
+            # シリーズ構造らしければそのまま返す
+            if "matches" in api_data or "mapBans" in api_data or "teams" in api_data:
+                return api_data
+            return _build_synthetic_series(api_data, match_id, original_url)
 
-    # ── Step 3: 合成シリーズdictを作成（シリーズIDが見つからない場合） ──
-    logger.info("シリーズIDが見つからないため、マッチデータから合成シリーズdictを作成します")
-    return _build_synthetic_series(match_data, match_id, original_url)
+    else:
+        # FALLBACK (Playwright 未インストール): requests による取得
+        logger.warning(
+            "Playwrightブラウザが利用できません。requestsでフォールバックします"
+            "（rib.gg のボット検出によりブロックされる可能性があります）"
+        )
+        match_data = fetch_match_data(client, match_id, original_url=original_url)
+        if match_data:
+            series_obj = match_data.get("series")
+            series_id_from_match = (
+                match_data.get("seriesId")
+                or match_data.get("series_id")
+                or (series_obj.get("id") if isinstance(series_obj, dict) else None)
+            )
+            if series_id_from_match:
+                series_data = fetch_series_data(client, str(series_id_from_match))
+                if series_data:
+                    return series_data
+            return _build_synthetic_series(match_data, match_id, original_url)
+
+    logger.error("シリーズデータの取得に失敗しました: match_id=%s", match_id)
+    return None
 
 
 def _slug_to_name(url_path: str) -> str:
