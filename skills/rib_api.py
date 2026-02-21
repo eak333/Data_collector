@@ -773,6 +773,7 @@ def _dig_series_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, 
       props.pageProps.content.series  (イベントページ・ネスト)
     """
     page_props = next_data.get("props", {}).get("pageProps", {})
+    logger.debug("_dig_series pageProps keys: %s", list(page_props.keys()))
 
     # --- パターン1: series/seriesData キー直下 ---
     candidate = (
@@ -1005,7 +1006,15 @@ def fetch_match_as_series_data(
             page_props = next_data.get("props", {}).get("pageProps", {})
             logger.debug("pageProps keys: %s", list(page_props.keys()))
 
-            # Step 1: series/content キーを確認（content は /events/.../matches/{id} で使われる）
+            # content キーのデバッグログ（構造把握用）
+            _content = page_props.get("content")
+            if _content is not None:
+                if isinstance(_content, dict):
+                    logger.debug("pageProps.content keys: %s", list(_content.keys()))
+                else:
+                    logger.debug("pageProps.content type=%s, value=%r", type(_content).__name__, _content)
+
+            # Step 1: series/content キーを確認
             series = _dig_series_from_next_data(next_data)
             if series:
                 logger.info("__NEXT_DATA__ からシリーズデータを直接取得しました")
@@ -1030,8 +1039,9 @@ def fetch_match_as_series_data(
                         return series_data
                 return _build_synthetic_series(match_data, match_id, original_url)
 
-            # Step 3: pageProps.event の中から match_id に一致するシリーズ/マッチを探す
-            # イベントページでは event.matches / event.series にリストが含まれることがある
+            # Step 3: pageProps.event.series の中から match_id に一致するシリーズを探す
+            # イベントページの event.series は軽量なインデックスリスト。
+            # 一致するIDが見つかったら /series/{id} からフルデータを取得する。
             event_data = page_props.get("event")
             if isinstance(event_data, dict):
                 logger.debug("pageProps.event keys: %s", list(event_data.keys()))
@@ -1041,13 +1051,19 @@ def fetch_match_as_series_data(
                         item_id = str(item.get("id") or item.get("matchId") or "")
                         if item_id == match_id:
                             logger.info(
-                                "pageProps.event.%s から id=%s を発見しました",
-                                collection_key, match_id,
+                                "pageProps.event.%s から id=%s を発見。"
+                                "/series/%s からフルデータを取得します",
+                                collection_key, match_id, match_id,
                             )
-                            return item
-                # event 自体のIDが一致する場合
-                if str(event_data.get("id", "")) == match_id:
-                    return event_data
+                            # 軽量エントリなので /series/{id} ページからフルデータを取得
+                            full_series = fetch_series_data(client, match_id)
+                            if full_series:
+                                return full_series
+                            # fetch_series_data が失敗した場合のみ軽量エントリから合成
+                            logger.warning(
+                                "/series/%s の取得に失敗。軽量エントリから合成します", match_id
+                            )
+                            return _build_synthetic_series(item, match_id, original_url)
 
         # __NEXT_DATA__ に有効なデータなし → APIインターセプトを複数パターンで試みる
         logger.info(
