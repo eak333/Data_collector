@@ -1065,9 +1065,22 @@ def fetch_match_as_series_data(
                             )
                             return _build_synthetic_series(item, match_id, original_url)
 
-        # __NEXT_DATA__ に有効なデータなし → APIインターセプトを複数パターンで試みる
+        # Step 4: match_id を series_id として /series/{id} を直接訪問する
+        # /events/{slug}/matches/{id} のIDはrib.ggのシリーズIDと同一であることが多い。
+        # event.series での検索が失敗しても、直接 /series/{id} を試みる。
         logger.info(
-            "__NEXT_DATA__ に有効なデータなし。APIインターセプトを試みます: %s", original_url
+            "event.series での検索失敗。match_id=%s を series_id として"
+            " https://www.rib.gg/series/%s を直接訪問します",
+            match_id, match_id,
+        )
+        direct_series = fetch_series_data(client, match_id)
+        if direct_series:
+            logger.info("/series/%s からシリーズデータを取得しました", match_id)
+            return direct_series
+
+        # Step 5: APIインターセプト（最終手段）
+        logger.info(
+            "直接取得も失敗。APIインターセプトを試みます: %s", original_url
         )
         for api_pattern in ["/api/", "/graphql", f"/{match_id}", "/series/", "/match/"]:
             api_data = client._browser.intercept_api(original_url, api_pattern=api_pattern)
