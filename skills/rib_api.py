@@ -1039,49 +1039,54 @@ def fetch_match_as_series_data(
                         return series_data
                 return _build_synthetic_series(match_data, match_id, original_url)
 
-            # Step 3: pageProps.event.series の中から match_id に一致するシリーズを探す
-            # イベントページの event.series は軽量なインデックスリスト。
-            # 一致するIDが見つかったら /series/{id} からフルデータを取得する。
-            event_data = page_props.get("event")
-            if isinstance(event_data, dict):
-                logger.debug("pageProps.event keys: %s", list(event_data.keys()))
+            # Step 3: pageProps.event と pageProps.stage の中から match_id を検索する
+            # ─ event.series: イベント全体のシリーズインデックス（ページネーション有り）
+            # ─ stage.series: 現在表示中のステージ（グループステージ/プレーオフ等）のシリーズリスト
+            #   → match_id はステージ配下に存在する可能性が高い
+            def _search_for_match_in_source(
+                source_data: Dict[str, Any], source_name: str
+            ) -> Optional[Dict[str, Any]]:
+                """指定データソース内から match_id に一致するシリーズ/マッチを検索する。"""
                 for collection_key in ("series", "matches", "games"):
-                    collection = event_data.get(collection_key) or []
+                    collection = source_data.get(collection_key) or []
+                    if collection and isinstance(collection[0], dict):
+                        logger.debug(
+                            "pageProps.%s.%s[0] keys: %s",
+                            source_name, collection_key, list(collection[0].keys()),
+                        )
                     for item in collection:
-                        item_id = str(item.get("id") or item.get("matchId") or "")
-                        if item_id == match_id:
-                            logger.info(
-                                "pageProps.event.%s から id=%s を発見。"
-                                "/series/%s からフルデータを取得します",
-                                collection_key, match_id, match_id,
-                            )
-                            # 軽量エントリなので /series/{id} ページからフルデータを取得
-                            full_series = fetch_series_data(client, match_id)
-                            if full_series:
-                                return full_series
-                            # fetch_series_data が失敗した場合のみ軽量エントリから合成
-                            logger.warning(
-                                "/series/%s の取得に失敗。軽量エントリから合成します", match_id
-                            )
-                            return _build_synthetic_series(item, match_id, original_url)
+                        if not isinstance(item, dict):
+                            continue
+                        # 複数のIDフィールド名を試みる
+                        for id_field in ("id", "matchId", "seriesId", "externalId", "uid"):
+                            item_id = str(item.get(id_field, ""))
+                            if item_id == match_id:
+                                logger.info(
+                                    "pageProps.%s.%s[%s=%s] を発見しました",
+                                    source_name, collection_key, id_field, match_id,
+                                )
+                                return item
+                return None
 
-        # Step 4: match_id を series_id として /series/{id} を直接訪問する
-        # /events/{slug}/matches/{id} のIDはrib.ggのシリーズIDと同一であることが多い。
-        # event.series での検索が失敗しても、直接 /series/{id} を試みる。
-        logger.info(
-            "event.series での検索失敗。match_id=%s を series_id として"
-            " https://www.rib.gg/series/%s を直接訪問します",
-            match_id, match_id,
-        )
-        direct_series = fetch_series_data(client, match_id)
-        if direct_series:
-            logger.info("/series/%s からシリーズデータを取得しました", match_id)
-            return direct_series
+            for src_name, src_data in [
+                ("event", page_props.get("event")),
+                ("stage", page_props.get("stage")),
+            ]:
+                if not isinstance(src_data, dict):
+                    continue
+                logger.debug("pageProps.%s keys: %s", src_name, list(src_data.keys()))
+                found_item = _search_for_match_in_source(src_data, src_name)
+                if found_item:
+                    # アイテムにチーム・試合情報があればそのまま使用
+                    if any(k in found_item for k in ("teams", "matches", "games", "rounds")):
+                        logger.info("フルデータを含むシリーズエントリを返します")
+                        return found_item
+                    # 軽量エントリの場合は合成シリーズを返す（/series/{id} は別マッチ）
+                    logger.info("軽量シリーズエントリから合成シリーズdictを作成します")
+                    return _build_synthetic_series(found_item, match_id, original_url)
 
-        # Step 5: APIインターセプト（最終手段）
-        logger.info(
-            "直接取得も失敗。APIインターセプトを試みます: %s", original_url
-        )
+        # Step 4: APIインターセプトを複数パターンで試みる（最終手段）
+        logger.info("APIインターセプトを試みます: %s", original_url)
         for api_pattern in ["/api/", "/graphql", f"/{match_id}", "/series/", "/match/"]:
             api_data = client._browser.intercept_api(original_url, api_pattern=api_pattern)
             if api_data:
