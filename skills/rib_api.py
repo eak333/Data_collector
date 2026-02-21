@@ -735,6 +735,8 @@ def _dig_match_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, A
     """
     page_props = next_data.get("props", {}).get("pageProps", {})
     logger.debug("__NEXT_DATA__ pageProps keys: %s", list(page_props.keys()))
+
+    # --- パターン1: match/matchData キー直下 ---
     match = (
         page_props.get("match")
         or page_props.get("matchData")
@@ -742,9 +744,20 @@ def _dig_match_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, A
     )
     if match:
         return match
-    # pageProps 直下にラウンド等が含まれる場合
+
+    # --- パターン2: pageProps 直下にラウンド等が含まれる場合 ---
     if any(k in page_props for k in ("rounds", "events", "players", "killEvents")):
         return page_props
+
+    # --- パターン3: content キー ---
+    content = page_props.get("content")
+    if isinstance(content, dict):
+        if any(k in content for k in ("rounds", "killEvents", "kills", "players")):
+            return content
+        inner = content.get("match") or content.get("matchData")
+        if isinstance(inner, dict):
+            return inner
+
     return None
 
 
@@ -752,21 +765,38 @@ def _dig_series_from_next_data(next_data: Dict[str, Any]) -> Optional[Dict[str, 
     """
     __NEXT_DATA__ 構造からシリーズデータを掘り出すヘルパー。
 
-    rib.gg の /events/{slug}/matches/{id} ページでは、
-    pageProps.series にシリーズ全体（チーム・マッチ一覧・マップBan/Pick等）が
-    格納されることが多い。
-
-    対応バリエーション:
-      props.pageProps.series          (通常のシリーズ・イベント試合ページ)
+    rib.gg のページ構造バリエーションに対応:
+      props.pageProps.series          (シリーズ専用ページ)
       props.pageProps.seriesData      (旧バージョン)
       props.pageProps.data.series     (ネスト構造)
+      props.pageProps.content         (イベントページ: /events/{slug}/matches/{id})
+      props.pageProps.content.series  (イベントページ・ネスト)
     """
     page_props = next_data.get("props", {}).get("pageProps", {})
-    return (
+
+    # --- パターン1: series/seriesData キー直下 ---
+    candidate = (
         page_props.get("series")
         or page_props.get("seriesData")
         or (page_props.get("data") or {}).get("series")
     )
+    if candidate:
+        return candidate
+
+    # --- パターン2: content キー ---
+    # /events/{slug}/matches/{id} ページでは pageProps.content に
+    # 当該マッチ（シリーズ）のデータが格納される
+    content = page_props.get("content")
+    if isinstance(content, dict):
+        # content 自体がシリーズデータの場合
+        if any(k in content for k in ("teams", "matches", "mapBans")):
+            return content
+        # content 内の series/match キー
+        inner = content.get("series") or content.get("seriesData") or content.get("match")
+        if isinstance(inner, dict):
+            return inner
+
+    return None
 
 
 def _build_synthetic_series(
@@ -975,8 +1005,7 @@ def fetch_match_as_series_data(
             page_props = next_data.get("props", {}).get("pageProps", {})
             logger.debug("pageProps keys: %s", list(page_props.keys()))
 
-            # Step 1: series キーを最初に確認
-            # /events/{slug}/matches/{id} ページは pageProps.series にシリーズデータを持つことが多い
+            # Step 1: series/content キーを確認（content は /events/.../matches/{id} で使われる）
             series = _dig_series_from_next_data(next_data)
             if series:
                 logger.info("__NEXT_DATA__ からシリーズデータを直接取得しました")
@@ -1001,17 +1030,36 @@ def fetch_match_as_series_data(
                         return series_data
                 return _build_synthetic_series(match_data, match_id, original_url)
 
-        # __NEXT_DATA__ に有効なデータなし → APIインターセプト
+            # Step 3: pageProps.event の中から match_id に一致するシリーズ/マッチを探す
+            # イベントページでは event.matches / event.series にリストが含まれることがある
+            event_data = page_props.get("event")
+            if isinstance(event_data, dict):
+                logger.debug("pageProps.event keys: %s", list(event_data.keys()))
+                for collection_key in ("series", "matches", "games"):
+                    collection = event_data.get(collection_key) or []
+                    for item in collection:
+                        item_id = str(item.get("id") or item.get("matchId") or "")
+                        if item_id == match_id:
+                            logger.info(
+                                "pageProps.event.%s から id=%s を発見しました",
+                                collection_key, match_id,
+                            )
+                            return item
+                # event 自体のIDが一致する場合
+                if str(event_data.get("id", "")) == match_id:
+                    return event_data
+
+        # __NEXT_DATA__ に有効なデータなし → APIインターセプトを複数パターンで試みる
         logger.info(
             "__NEXT_DATA__ に有効なデータなし。APIインターセプトを試みます: %s", original_url
         )
-        api_data = client._browser.intercept_api(original_url)
-        if api_data:
-            logger.info("APIインターセプトからデータを取得しました")
-            # シリーズ構造らしければそのまま返す
-            if "matches" in api_data or "mapBans" in api_data or "teams" in api_data:
-                return api_data
-            return _build_synthetic_series(api_data, match_id, original_url)
+        for api_pattern in ["/api/", "/graphql", f"/{match_id}", "/series/", "/match/"]:
+            api_data = client._browser.intercept_api(original_url, api_pattern=api_pattern)
+            if api_data:
+                logger.info("APIインターセプトからデータを取得しました (pattern=%s)", api_pattern)
+                if "matches" in api_data or "mapBans" in api_data or "teams" in api_data:
+                    return api_data
+                return _build_synthetic_series(api_data, match_id, original_url)
 
     else:
         # FALLBACK (Playwright 未インストール): requests による取得
